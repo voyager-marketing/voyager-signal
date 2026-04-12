@@ -9,6 +9,8 @@
 //   get_entry        — read a single Notion page with full synthesis
 //   get_high_signals — fetch score 4-5 entries for a time window
 //   synthesize_topic — ask Claude to synthesize across entries for a topic
+//   update_entry     — update a brain entry's score, tags, domain, or signal_type
+//   export_brain     — export the brain as markdown or CSV
 //
 // Env vars required:
 //   NOTION_TOKEN     — Notion integration token
@@ -557,25 +559,33 @@ server.tool(
 
     const entries = data.results.map(formatPage);
 
-    // For each entry, fetch the page blocks to find to-do items
+    // Fetch page blocks in parallel batches (concurrency limit of 5)
     const actions = [];
-    for (const entry of entries.slice(0, 20)) {
-      try {
-        const blocks = await notionFetch(`/blocks/${entry.id}/children?page_size=100`);
-        const todos = blocks.results
-          .filter(b => b.type === 'to_do')
-          .map(b => ({
-            action: extractText(b.to_do?.rich_text),
-            done: b.to_do?.checked || false,
-            from: entry.title,
-            domain: entry.domain,
-            score: entry.score,
-            url: entry.url
-          }));
-        actions.push(...todos);
-      } catch {
-        // Skip entries we can't read
-      }
+    const entriesToFetch = entries.slice(0, 20);
+    const CONCURRENCY = 5;
+
+    for (let i = 0; i < entriesToFetch.length; i += CONCURRENCY) {
+      const batch = entriesToFetch.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (entry) => {
+          try {
+            const blocks = await notionFetch(`/blocks/${entry.id}/children?page_size=100`);
+            return blocks.results
+              .filter(b => b.type === 'to_do')
+              .map(b => ({
+                action: extractText(b.to_do?.rich_text),
+                done: b.to_do?.checked || false,
+                from: entry.title,
+                domain: entry.domain,
+                score: entry.score,
+                url: entry.url
+              }));
+          } catch {
+            return [];
+          }
+        })
+      );
+      results.forEach(todos => actions.push(...todos));
     }
 
     // Group by domain
@@ -595,6 +605,166 @@ server.tool(
           completed: actions.filter(a => a.done).length,
           by_domain: byDomain
         }, null, 2)
+      }]
+    };
+  }
+);
+
+// --- update_entry ---
+server.tool(
+  'update_entry',
+  'Update a brain entry\'s score, tags, domain, or signal_type. Uses the Notion API to patch page properties.',
+  {
+    page_id: z.string().describe('Notion page ID to update'),
+    score: z.number().min(1).max(5).optional().describe('New signal score (1-5)'),
+    tags: z.array(z.string()).optional().describe('Replace tags with this list'),
+    domain: z.string().optional().describe('New domain (e.g. ai, growth, brand, content)'),
+    signal_type: z.string().optional().describe('New signal type (e.g. trend, competitor, tactic, insight)')
+  },
+  async ({ page_id, score, tags, domain, signal_type }) => {
+    const properties = {};
+
+    if (score !== undefined) {
+      properties.Score = { number: score };
+    }
+    if (tags !== undefined) {
+      properties.Tags = { multi_select: tags.map(name => ({ name })) };
+    }
+    if (domain !== undefined) {
+      properties.Domain = { select: { name: domain } };
+    }
+    if (signal_type !== undefined) {
+      properties['Signal Type'] = { select: { name: signal_type } };
+    }
+
+    if (Object.keys(properties).length === 0) {
+      return {
+        content: [{ type: 'text', text: 'Error: No fields to update. Provide at least one of: score, tags, domain, signal_type.' }]
+      };
+    }
+
+    const updated = await notionFetch(`/pages/${page_id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ properties })
+    });
+
+    const entry = formatPage(updated);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ message: 'Entry updated successfully', entry }, null, 2)
+      }]
+    };
+  }
+);
+
+// --- export_brain ---
+server.tool(
+  'export_brain',
+  'Export the Voyager brain as markdown or CSV. Queries Notion entries filtered by recency and minimum score.',
+  {
+    format: z.enum(['markdown', 'csv']).describe('Export format: "markdown" or "csv"'),
+    days: z.number().optional().default(30).describe('Lookback window in days (default 30)'),
+    min_score: z.number().optional().default(1).describe('Minimum score filter (default 1)')
+  },
+  async ({ format, days, min_score }) => {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    // Fetch all matching entries (paginate up to 300)
+    let allEntries = [];
+    let hasMore = true;
+    let startCursor = undefined;
+
+    while (hasMore && allEntries.length < 300) {
+      const body = {
+        filter: {
+          and: [
+            { property: 'Score', number: { greater_than_or_equal_to: min_score } },
+            { timestamp: 'created_time', created_time: { on_or_after: since } }
+          ]
+        },
+        sorts: [{ property: 'Score', direction: 'descending' }],
+        page_size: 100
+      };
+      if (startCursor) body.start_cursor = startCursor;
+
+      const data = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+
+      allEntries.push(...data.results.map(formatPage));
+      hasMore = data.has_more;
+      startCursor = data.next_cursor;
+    }
+
+    if (allEntries.length === 0) {
+      return {
+        content: [{ type: 'text', text: `No entries found in the last ${days} days with score >= ${min_score}.` }]
+      };
+    }
+
+    if (format === 'csv') {
+      const escapeCSV = (val) => {
+        const str = String(val ?? '');
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const header = 'title,url,score,domain,signal_type,tags,summary,created';
+      const rows = allEntries.map(e =>
+        [
+          escapeCSV(e.title),
+          escapeCSV(e.url),
+          escapeCSV(e.score),
+          escapeCSV(e.domain),
+          escapeCSV(e.signal_type),
+          escapeCSV(e.tags.join('; ')),
+          escapeCSV(e.summary),
+          escapeCSV(e.created)
+        ].join(',')
+      );
+
+      return {
+        content: [{
+          type: 'text',
+          text: [header, ...rows].join('\n')
+        }]
+      };
+    }
+
+    // Markdown format — group by domain
+    const byDomain = {};
+    allEntries.forEach(e => {
+      const d = e.domain || 'uncategorized';
+      if (!byDomain[d]) byDomain[d] = [];
+      byDomain[d].push(e);
+    });
+
+    let md = `# Voyager Brain Export\n\n`;
+    md += `_${allEntries.length} entries | Last ${days} days | Min score: ${min_score}_\n\n`;
+
+    Object.entries(byDomain)
+      .sort((a, b) => b[1].length - a[1].length)
+      .forEach(([domain, items]) => {
+        md += `## ${domain}\n\n`;
+        items.forEach(e => {
+          md += `### ${e.title}\n`;
+          md += `- **Score:** ${e.score} | **Type:** ${e.signal_type} | **Source:** ${e.source || 'unknown'}\n`;
+          md += `- **URL:** ${e.url || 'none'}\n`;
+          md += `- **Tags:** ${e.tags.length > 0 ? e.tags.join(', ') : 'none'}\n`;
+          md += `- **Created:** ${e.created}\n`;
+          if (e.summary) md += `\n${e.summary}\n`;
+          md += '\n';
+        });
+      });
+
+    return {
+      content: [{
+        type: 'text',
+        text: md
       }]
     };
   }
