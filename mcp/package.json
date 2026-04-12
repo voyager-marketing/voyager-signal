@@ -8,7 +8,8 @@
     "voyager-brain-mcp": "./server.js"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "setup": "node setup.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
