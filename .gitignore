@@ -2,6 +2,6 @@ node_modules/
 .env
 *.crx
 *.pem
-*.zip
+dist/
 .DS_Store
 Thumbs.db

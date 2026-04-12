@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Save to Voyager",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Voyager Marketing's AI-powered content capture — save articles, threads, and newsletters to the Voyager brain.",
   "permissions": [
     "activeTab",
     "storage",
-    "contextMenus"
+    "contextMenus",
+    "scripting"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -30,5 +31,19 @@
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
+  },
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://api.notion.com/*",
+    "https://hooks.slack.com/*"
+  ],
+  "commands": {
+    "save-current-page": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "Save current page to Voyager"
+    }
   }
 }
