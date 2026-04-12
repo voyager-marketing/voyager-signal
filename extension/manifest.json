@@ -23,7 +23,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["src/readability.js", "src/content.js"],
+      "js": ["src/readability.js", "src/extractors/x-thread.js", "src/content.js"],
       "run_at": "document_idle"
     }
   ],
