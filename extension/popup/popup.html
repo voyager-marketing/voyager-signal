@@ -10,6 +10,7 @@
   <div id="app">
     <header>
       <h1>Save to Voyager</h1>
+      <span id="version" class="version"></span>
     </header>
 
     <div id="status" class="status"></div>
@@ -17,22 +18,27 @@
     <div id="preview">
       <p id="page-title" class="preview-title">Loading…</p>
       <p id="page-url" class="preview-url"></p>
-      <p id="page-source" class="preview-source"></p>
+      <div class="preview-meta">
+        <span id="page-source" class="badge"></span>
+        <span id="word-count" class="meta-text"></span>
+      </div>
     </div>
 
     <button id="save-btn" class="btn-primary" disabled>Save to Voyager</button>
+    <p class="shortcut-hint">Alt+Shift+S to quick-save</p>
+
+    <details id="history-panel">
+      <summary>Recent saves <span id="history-count" class="count-badge">0</span></summary>
+      <div id="history-list" class="history-body">
+        <p class="empty-state">No saves yet.</p>
+      </div>
+    </details>
 
     <details id="settings-panel">
       <summary>Settings</summary>
       <div class="settings-body">
         <label for="webhook-url">n8n Webhook URL</label>
         <input type="url" id="webhook-url" placeholder="https://your-n8n.app/webhook/...">
-
-        <label for="notion-token">Notion Token</label>
-        <input type="password" id="notion-token" placeholder="ntn_...">
-
-        <label for="claude-key">Claude API Key</label>
-        <input type="password" id="claude-key" placeholder="sk-ant-...">
 
         <button id="save-settings" class="btn-secondary">Save Settings</button>
       </div>
