@@ -27,6 +27,8 @@
     <button id="save-btn" class="btn-primary" disabled>Save to Voyager</button>
     <p class="shortcut-hint">Alt+Shift+S to quick-save</p>
 
+    <div id="enrichment-result" class="enrichment hidden"></div>
+
     <details id="history-panel">
       <summary>Recent saves <span id="history-count" class="count-badge">0</span></summary>
       <div id="history-list" class="history-body">
@@ -37,8 +39,17 @@
     <details id="settings-panel">
       <summary>Settings</summary>
       <div class="settings-body">
-        <label for="webhook-url">n8n Webhook URL</label>
-        <input type="url" id="webhook-url" placeholder="https://your-n8n.app/webhook/...">
+        <label for="claude-key">Claude API Key</label>
+        <input type="password" id="claude-key" placeholder="sk-ant-...">
+
+        <label for="notion-token">Notion Integration Token</label>
+        <input type="password" id="notion-token" placeholder="ntn_...">
+
+        <label for="notion-db-id">Notion Database ID</label>
+        <input type="text" id="notion-db-id" placeholder="81eb2b5a-05f6-433e-8c89-0d7c78cb798e">
+
+        <label for="slack-webhook">Slack Webhook URL <span class="optional">(optional)</span></label>
+        <input type="url" id="slack-webhook" placeholder="https://hooks.slack.com/...">
 
         <button id="save-settings" class="btn-secondary">Save Settings</button>
       </div>

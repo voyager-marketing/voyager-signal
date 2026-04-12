@@ -32,6 +32,11 @@
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://api.notion.com/*",
+    "https://hooks.slack.com/*"
+  ],
   "commands": {
     "save-current-page": {
       "suggested_key": {

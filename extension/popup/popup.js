@@ -1,4 +1,5 @@
 // Save to Voyager — popup controller
+// Direct pipeline: Claude scoring → Notion write → Slack alert
 
 const statusEl = document.getElementById('status');
 const titleEl = document.getElementById('page-title');
@@ -6,7 +7,11 @@ const urlEl = document.getElementById('page-url');
 const sourceEl = document.getElementById('page-source');
 const wordCountEl = document.getElementById('word-count');
 const saveBtn = document.getElementById('save-btn');
-const webhookInput = document.getElementById('webhook-url');
+const enrichmentEl = document.getElementById('enrichment-result');
+const claudeKeyInput = document.getElementById('claude-key');
+const notionTokenInput = document.getElementById('notion-token');
+const notionDbIdInput = document.getElementById('notion-db-id');
+const slackWebhookInput = document.getElementById('slack-webhook');
 const saveSettingsBtn = document.getElementById('save-settings');
 const historyList = document.getElementById('history-list');
 const historyCount = document.getElementById('history-count');
@@ -26,7 +31,6 @@ function extractCurrentPage() {
     const tab = tabs[0];
     if (!tab) return showStatus('No active tab found.', 'error');
 
-    // Check for restricted URLs
     if (isRestrictedUrl(tab.url)) {
       titleEl.textContent = 'Cannot capture this page';
       urlEl.textContent = tab.url;
@@ -36,8 +40,7 @@ function extractCurrentPage() {
     }
 
     urlEl.textContent = tab.url;
-    const source = detectSource(tab.url);
-    sourceEl.textContent = source;
+    sourceEl.textContent = detectSource(tab.url);
 
     chrome.tabs.sendMessage(tab.id, { action: 'extractContent' }, (response) => {
       if (chrome.runtime.lastError) {
@@ -83,8 +86,9 @@ saveBtn.addEventListener('click', () => {
   if (!extractedData) return;
 
   saveBtn.disabled = true;
-  saveBtn.textContent = 'Saving…';
-  showStatus('Sending to Voyager…', 'loading');
+  saveBtn.textContent = 'Scoring with Claude…';
+  showStatus('Analyzing content with Claude…', 'loading');
+  enrichmentEl.className = 'enrichment hidden';
 
   chrome.runtime.sendMessage({ action: 'capture', data: extractedData }, (response) => {
     if (chrome.runtime.lastError) {
@@ -95,8 +99,10 @@ saveBtn.addEventListener('click', () => {
     }
 
     if (response && response.success) {
+      const r = response.result;
       showStatus('Saved to Voyager!', 'success');
       saveBtn.textContent = 'Saved!';
+      showEnrichment(r);
       loadHistory();
     } else {
       showStatus('Error: ' + (response?.error || 'Unknown error'), 'error');
@@ -106,20 +112,57 @@ saveBtn.addEventListener('click', () => {
   });
 });
 
+// --- Show enrichment result ---
+function showEnrichment(result) {
+  if (!result || !result.score) return;
+
+  const tagsHtml = (result.tags || [])
+    .map(t => '<span class="tag">' + escapeHtml(t) + '</span>')
+    .join('');
+
+  enrichmentEl.innerHTML =
+    '<div class="enrichment-header">' +
+      '<span class="score-badge score-' + result.score + '">Score: ' + result.score + '</span>' +
+      '<span class="signal-type">' + escapeHtml(result.signal_type || '') + '</span>' +
+    '</div>' +
+    '<p class="enrichment-summary">' + escapeHtml(result.summary || '') + '</p>' +
+    (tagsHtml ? '<div class="enrichment-tags">' + tagsHtml + '</div>' : '');
+
+  enrichmentEl.className = 'enrichment';
+}
+
 // --- Settings ---
 function loadSettings() {
-  chrome.storage.sync.get(['webhookUrl'], (s) => {
-    if (s.webhookUrl) webhookInput.value = s.webhookUrl;
-  });
+  chrome.storage.sync.get(
+    ['claudeApiKey', 'notionToken', 'notionDbId', 'slackWebhookUrl'],
+    (s) => {
+      if (s.claudeApiKey) claudeKeyInput.value = s.claudeApiKey;
+      if (s.notionToken) notionTokenInput.value = s.notionToken;
+      if (s.notionDbId) notionDbIdInput.value = s.notionDbId;
+      if (s.slackWebhookUrl) slackWebhookInput.value = s.slackWebhookUrl;
+    }
+  );
 }
 
 saveSettingsBtn.addEventListener('click', () => {
-  const url = webhookInput.value.trim();
-  if (url && !url.startsWith('https://')) {
-    showStatus('Webhook URL must use HTTPS.', 'error');
+  const claudeKey = claudeKeyInput.value.trim();
+  const notionToken = notionTokenInput.value.trim();
+
+  if (!claudeKey) {
+    showStatus('Claude API key is required.', 'error');
     return;
   }
-  chrome.storage.sync.set({ webhookUrl: url }, () => {
+  if (!notionToken) {
+    showStatus('Notion token is required.', 'error');
+    return;
+  }
+
+  chrome.storage.sync.set({
+    claudeApiKey: claudeKey,
+    notionToken: notionToken,
+    notionDbId: notionDbIdInput.value.trim(),
+    slackWebhookUrl: slackWebhookInput.value.trim()
+  }, () => {
     showStatus('Settings saved.', 'success');
     setTimeout(() => hideStatus(), 2000);
   });
@@ -152,6 +195,7 @@ function loadHistory() {
           scoreHtml +
           '<span class="history-time">' + time + '</span>' +
         '</div>' +
+        (item.summary ? '<p class="history-summary">' + escapeHtml(item.summary) + '</p>' : '') +
       '</div>';
     }).join('');
   });
