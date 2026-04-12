@@ -1,6 +1,6 @@
 // Save to Voyager — background service worker (MV3)
-// Pipeline: Extract → Claude scoring → Notion write → Slack alert (score 5)
-// No n8n — all API calls happen directly in the extension.
+// Smart ingestion: Extract → Claude synthesis → Notion brain → Slack alert
+// Builds a living knowledge base from anything on the web.
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -16,7 +16,7 @@ const RESTRICTED_URL_PATTERNS = [
 
 const BADGE_SUCCESS = { text: '\u2713', color: '#22c55e', duration: 2000 };
 const BADGE_ERROR   = { text: '!',  color: '#ef4444', duration: 3000 };
-const BADGE_SCORING = { text: '…',  color: '#3b82f6', duration: 30000 };
+const BADGE_WORKING = { text: '…',  color: '#3b82f6', duration: 30000 };
 
 const SAVE_HISTORY_KEY = 'saveHistory';
 const SAVE_HISTORY_MAX = 50;
@@ -24,23 +24,30 @@ const SAVE_HISTORY_MAX = 50;
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 
-const SCORING_PROMPT = `You are Voyager Signal, an AI content analyst for Voyager Marketing.
+const SYNTHESIS_PROMPT = `You are Voyager Signal — the ingestion layer of a marketing agency's knowledge brain (like Karpathy's Autoresearch, but for marketing strategy).
 
-Score the following article on a 1-5 scale for marketing signal value:
-- 5 = Urgent insight — immediately actionable for a client or strategy
-- 4 = High value — relevant trend, competitor move, or tactical insight
-- 3 = Moderate — useful context, worth filing
-- 2 = Low — tangentially related
-- 1 = Noise — not relevant
+Your job: deeply analyze this content and extract everything worth remembering. This entry goes into a Notion knowledge base that the team queries to make decisions, build strategies, and spot opportunities.
 
 Respond with JSON only:
 {
   "score": <1-5>,
-  "summary": "<2-3 sentence summary>",
-  "tags": ["<tag1>", "<tag2>"],
-  "signal_type": "<trend|competitor|tactic|insight|news|opinion>",
-  "relevance_reason": "<why this matters to a marketing agency>"
-}`;
+  "summary": "<2-3 sentence synthesis — not a description, but the INSIGHT. What does this mean?>",
+  "key_takeaways": ["<actionable learning 1>", "<actionable learning 2>", "<...up to 5>"],
+  "action_items": ["<specific thing the agency should do based on this>"],
+  "key_quotes": ["<verbatim quote worth saving, if any>"],
+  "tags": ["<tag1>", "<tag2>", "<...up to 5>"],
+  "domain": "<which knowledge area: ai|growth|brand|content|social|seo|paid|strategy|product|culture|tech|design>",
+  "signal_type": "<trend|competitor|tactic|insight|framework|case-study|data|opinion|tool|announcement>",
+  "novelty": "<what's new or contrarian here vs. conventional wisdom, in one sentence>",
+  "connections": "<what existing marketing concepts, frameworks, or trends does this connect to>"
+}
+
+Scoring guide:
+- 5 = Urgent — immediately actionable for a client or strategy, share now
+- 4 = High value — important trend, framework, or competitive insight
+- 3 = Useful context — worth filing, will be valuable in synthesis later
+- 2 = Low — tangentially related, thin on insight
+- 1 = Noise — not relevant to marketing/strategy`;
 
 // ---------------------------------------------------------------------------
 // Installation — context menu registration
@@ -73,10 +80,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'save-current-page') return;
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) {
-    console.warn('[Voyager] No active tab found for command.');
-    return;
-  }
+  if (!tab) return;
 
   await captureFromTab(tab);
 });
@@ -114,19 +118,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ---------------------------------------------------------------------------
 
 async function captureFromTab(tab) {
-  if (!tab?.id) {
-    console.warn('[Voyager] captureFromTab called without a valid tab.');
-    return;
-  }
+  if (!tab?.id) return;
 
   if (isRestrictedUrl(tab.url)) {
-    console.warn('[Voyager] Cannot capture restricted URL:', tab.url);
     showBadge(BADGE_ERROR, tab.id);
     return;
   }
 
   try {
-    showBadge(BADGE_SCORING, tab.id);
+    showBadge(BADGE_WORKING, tab.id);
     await ensureContentScript(tab.id);
 
     const response = await chrome.tabs.sendMessage(tab.id, {
@@ -147,7 +147,7 @@ async function captureFromTab(tab) {
 }
 
 // ---------------------------------------------------------------------------
-// Core pipeline: Claude scoring → Notion write → Slack alert
+// Core pipeline: Claude synthesis → Notion brain → Slack alert
 // ---------------------------------------------------------------------------
 
 async function handleCapture(data) {
@@ -164,35 +164,41 @@ async function handleCapture(data) {
 
   const source = detectSource(data.url);
 
-  // Step 1: Score with Claude
-  const enrichment = await scoreWithClaude(settings.claudeApiKey, data, source);
+  // Step 1: Deep synthesis with Claude
+  const synthesis = await synthesizeWithClaude(settings.claudeApiKey, data, source);
 
-  // Step 2: Write to Notion
+  // Step 2: Write rich knowledge entry to Notion
   const notionDbId = settings.notionDbId || '81eb2b5a-05f6-433e-8c89-0d7c78cb798e';
-  const notionPage = await writeToNotion(settings.notionToken, notionDbId, data, enrichment, source);
+  const notionPage = await writeToNotion(
+    settings.notionToken, notionDbId, data, synthesis, source
+  );
 
   // Step 3: Slack alert if score >= 5
-  if (enrichment.score >= 5 && settings.slackWebhookUrl) {
-    await sendSlackAlert(settings.slackWebhookUrl, data, enrichment);
+  if (synthesis.score >= 5 && settings.slackWebhookUrl) {
+    await sendSlackAlert(settings.slackWebhookUrl, data, synthesis);
   }
 
   return {
     status: 'saved',
     url: data.url,
-    score: enrichment.score,
-    summary: enrichment.summary,
-    signal_type: enrichment.signal_type,
-    tags: enrichment.tags,
+    score: synthesis.score,
+    summary: synthesis.summary,
+    key_takeaways: synthesis.key_takeaways,
+    action_items: synthesis.action_items,
+    domain: synthesis.domain,
+    signal_type: synthesis.signal_type,
+    novelty: synthesis.novelty,
+    tags: synthesis.tags,
     notionPageId: notionPage?.id || null
   };
 }
 
 // ---------------------------------------------------------------------------
-// Claude API — content scoring
+// Claude API — deep content synthesis
 // ---------------------------------------------------------------------------
 
-async function scoreWithClaude(apiKey, data, source) {
-  const contentSnippet = (data.content || '').slice(0, 3000);
+async function synthesizeWithClaude(apiKey, data, source) {
+  const contentSnippet = (data.content || '').slice(0, 5000);
 
   const userMessage = `Article:
 Title: ${data.title}
@@ -200,7 +206,7 @@ Source: ${source}
 URL: ${data.url}
 Byline: ${data.byline || 'Unknown'}
 
-Content (first 3000 chars):
+Content:
 ${contentSnippet}`;
 
   const response = await fetch(CLAUDE_API_URL, {
@@ -213,9 +219,9 @@ ${contentSnippet}`;
     },
     body: JSON.stringify({
       model: CLAUDE_MODEL,
-      max_tokens: 500,
+      max_tokens: 1024,
       messages: [
-        { role: 'user', content: SCORING_PROMPT + '\n\n' + userMessage }
+        { role: 'user', content: SYNTHESIS_PROMPT + '\n\n' + userMessage }
       ]
     })
   });
@@ -228,7 +234,6 @@ ${contentSnippet}`;
   const result = await response.json();
   const text = result.content?.[0]?.text || '';
 
-  // Parse JSON from response (handle markdown code blocks)
   try {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
@@ -238,52 +243,51 @@ ${contentSnippet}`;
     console.warn('[Voyager] Could not parse Claude response:', e);
   }
 
-  // Fallback if parsing fails
   return {
     score: 3,
-    summary: 'Could not parse enrichment — saved with default score.',
+    summary: 'Could not parse synthesis — saved with default score.',
+    key_takeaways: [],
+    action_items: [],
+    key_quotes: [],
     tags: ['needs-review'],
+    domain: 'unknown',
     signal_type: 'unknown',
-    relevance_reason: 'Auto-saved, enrichment parsing failed.'
+    novelty: '',
+    connections: ''
   };
 }
 
 // ---------------------------------------------------------------------------
-// Notion API — write to Media Vault
+// Notion API — write rich knowledge entry
 // ---------------------------------------------------------------------------
 
-async function writeToNotion(notionToken, databaseId, data, enrichment, source) {
+async function writeToNotion(notionToken, databaseId, data, synthesis, source) {
+  // Database row properties
   const properties = {
-    // Title property (Name / Title)
     'Name': {
       title: [{ text: { content: (data.title || 'Untitled').slice(0, 200) } }]
     },
-    'URL': {
-      url: data.url || null
-    },
-    'Source': {
-      select: { name: source }
-    },
-    'Score': {
-      number: enrichment.score
-    },
+    'URL': { url: data.url || null },
+    'Source': { select: { name: source } },
+    'Score': { number: synthesis.score },
+    'Domain': { select: { name: synthesis.domain || 'unknown' } },
+    'Signal Type': { select: { name: synthesis.signal_type || 'unknown' } },
     'Summary': {
-      rich_text: [{ text: { content: (enrichment.summary || '').slice(0, 2000) } }]
-    },
-    'Signal Type': {
-      select: { name: enrichment.signal_type || 'unknown' }
+      rich_text: [{ text: { content: (synthesis.summary || '').slice(0, 2000) } }]
     },
     'Byline': {
       rich_text: [{ text: { content: (data.byline || '').slice(0, 200) } }]
     }
   };
 
-  // Tags as multi-select (only if we have tags)
-  if (enrichment.tags && enrichment.tags.length > 0) {
+  if (synthesis.tags && synthesis.tags.length > 0) {
     properties['Tags'] = {
-      multi_select: enrichment.tags.map(tag => ({ name: tag }))
+      multi_select: synthesis.tags.map(tag => ({ name: tag }))
     };
   }
+
+  // Page body — the rich knowledge card
+  const children = buildNotionBody(data, synthesis);
 
   const response = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
@@ -294,35 +298,120 @@ async function writeToNotion(notionToken, databaseId, data, enrichment, source) 
     },
     body: JSON.stringify({
       parent: { database_id: databaseId },
-      properties
+      properties,
+      children
     })
   });
 
   if (!response.ok) {
     const errText = await response.text();
     console.error('[Voyager] Notion write failed:', errText);
-    // Don't throw — we still saved the enrichment, Notion is secondary
     return null;
   }
 
   return response.json();
 }
 
+// Build Notion page body blocks
+function buildNotionBody(data, synthesis) {
+  const blocks = [];
+
+  // Synthesis summary
+  blocks.push(heading('Synthesis'));
+  blocks.push(paragraph(synthesis.summary || ''));
+
+  // Key takeaways
+  if (synthesis.key_takeaways?.length > 0) {
+    blocks.push(heading('Key Takeaways'));
+    synthesis.key_takeaways.forEach(t => blocks.push(bullet(t)));
+  }
+
+  // Action items
+  if (synthesis.action_items?.length > 0) {
+    blocks.push(heading('Action Items'));
+    synthesis.action_items.forEach(a => blocks.push(todo(a)));
+  }
+
+  // What's novel
+  if (synthesis.novelty) {
+    blocks.push(heading('What\'s New / Contrarian'));
+    blocks.push(paragraph(synthesis.novelty));
+  }
+
+  // Connections
+  if (synthesis.connections) {
+    blocks.push(heading('Connections'));
+    blocks.push(paragraph(synthesis.connections));
+  }
+
+  // Key quotes
+  if (synthesis.key_quotes?.length > 0) {
+    blocks.push(heading('Key Quotes'));
+    synthesis.key_quotes.forEach(q => blocks.push(quote(q)));
+  }
+
+  // Source metadata
+  blocks.push(divider());
+  blocks.push(paragraph(
+    `Source: ${data.url}\nByline: ${data.byline || 'Unknown'}\n` +
+    `Captured: ${new Date().toISOString()}`
+  ));
+
+  return blocks;
+}
+
+// Notion block helpers
+function heading(text) {
+  return {
+    object: 'block', type: 'heading_2',
+    heading_2: { rich_text: [{ type: 'text', text: { content: text } }] }
+  };
+}
+function paragraph(text) {
+  return {
+    object: 'block', type: 'paragraph',
+    paragraph: { rich_text: [{ type: 'text', text: { content: text.slice(0, 2000) } }] }
+  };
+}
+function bullet(text) {
+  return {
+    object: 'block', type: 'bulleted_list_item',
+    bulleted_list_item: { rich_text: [{ type: 'text', text: { content: text.slice(0, 2000) } }] }
+  };
+}
+function todo(text) {
+  return {
+    object: 'block', type: 'to_do',
+    to_do: { rich_text: [{ type: 'text', text: { content: text.slice(0, 2000) } }], checked: false }
+  };
+}
+function quote(text) {
+  return {
+    object: 'block', type: 'quote',
+    quote: { rich_text: [{ type: 'text', text: { content: text.slice(0, 2000) } }] }
+  };
+}
+function divider() {
+  return { object: 'block', type: 'divider', divider: {} };
+}
+
 // ---------------------------------------------------------------------------
 // Slack — alert on score 5 signals
 // ---------------------------------------------------------------------------
 
-async function sendSlackAlert(webhookUrl, data, enrichment) {
+async function sendSlackAlert(webhookUrl, data, synthesis) {
   try {
+    const takeaways = (synthesis.key_takeaways || []).slice(0, 3)
+      .map(t => `  • ${t}`).join('\n');
+
     await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        text: `*Signal Score 5* — ${data.title}\n${enrichment.summary}\n<${data.url}|Open article> · Signal: ${enrichment.signal_type}`
+        text: `*Signal Score 5* — ${data.title}\n${synthesis.summary}\n${takeaways ? '\n' + takeaways + '\n' : ''}\n<${data.url}|Open article> · ${synthesis.domain} · ${synthesis.signal_type}`
       })
     });
   } catch (err) {
-    // Slack is best-effort, don't fail the whole capture
     console.warn('[Voyager] Slack alert failed:', err);
   }
 }
@@ -382,6 +471,7 @@ async function addToHistory(data, result) {
       source: detectSource(data.url),
       score: result?.score ?? null,
       summary: result?.summary ?? '',
+      domain: result?.domain ?? '',
       savedAt: new Date().toISOString()
     };
 

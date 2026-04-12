@@ -86,8 +86,8 @@ saveBtn.addEventListener('click', () => {
   if (!extractedData) return;
 
   saveBtn.disabled = true;
-  saveBtn.textContent = 'Scoring with Claude…';
-  showStatus('Analyzing content with Claude…', 'loading');
+  saveBtn.textContent = 'Synthesizing…';
+  showStatus('Claude is analyzing and synthesizing…', 'loading');
   enrichmentEl.className = 'enrichment hidden';
 
   chrome.runtime.sendMessage({ action: 'capture', data: extractedData }, (response) => {
@@ -112,7 +112,7 @@ saveBtn.addEventListener('click', () => {
   });
 });
 
-// --- Show enrichment result ---
+// --- Show synthesis result ---
 function showEnrichment(result) {
   if (!result || !result.score) return;
 
@@ -120,14 +120,39 @@ function showEnrichment(result) {
     .map(t => '<span class="tag">' + escapeHtml(t) + '</span>')
     .join('');
 
-  enrichmentEl.innerHTML =
+  const takeawaysHtml = (result.key_takeaways || [])
+    .map(t => '<li>' + escapeHtml(t) + '</li>')
+    .join('');
+
+  const actionsHtml = (result.action_items || [])
+    .map(a => '<li>' + escapeHtml(a) + '</li>')
+    .join('');
+
+  let html =
     '<div class="enrichment-header">' +
       '<span class="score-badge score-' + result.score + '">Score: ' + result.score + '</span>' +
+      '<span class="domain-badge">' + escapeHtml(result.domain || '') + '</span>' +
       '<span class="signal-type">' + escapeHtml(result.signal_type || '') + '</span>' +
     '</div>' +
-    '<p class="enrichment-summary">' + escapeHtml(result.summary || '') + '</p>' +
-    (tagsHtml ? '<div class="enrichment-tags">' + tagsHtml + '</div>' : '');
+    '<p class="enrichment-summary">' + escapeHtml(result.summary || '') + '</p>';
 
+  if (takeawaysHtml) {
+    html += '<p class="enrichment-label">Key Takeaways</p><ul class="enrichment-list">' + takeawaysHtml + '</ul>';
+  }
+
+  if (actionsHtml) {
+    html += '<p class="enrichment-label">Actions</p><ul class="enrichment-list action-list">' + actionsHtml + '</ul>';
+  }
+
+  if (result.novelty) {
+    html += '<p class="enrichment-label">What\'s New</p><p class="enrichment-novelty">' + escapeHtml(result.novelty) + '</p>';
+  }
+
+  if (tagsHtml) {
+    html += '<div class="enrichment-tags">' + tagsHtml + '</div>';
+  }
+
+  enrichmentEl.innerHTML = html;
   enrichmentEl.className = 'enrichment';
 }
 
