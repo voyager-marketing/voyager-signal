@@ -1,0 +1,13 @@
+{
+  "model": "claude-sonnet-4-6",
+  "permissions": {
+    "allow": ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebFetch"],
+    "deny": ["github_force_push", "github_delete_repo"]
+  },
+  "hooks": {
+    "PreToolUse": ".claude/hooks/pre-tool.sh",
+    "PostToolUse": ".claude/hooks/post-tool.sh",
+    "Stop": ".claude/hooks/on-stop.sh"
+  },
+  "memory": "project"
+}

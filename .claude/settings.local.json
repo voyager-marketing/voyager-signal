@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s https://cdnjs.cloudflare.com/ajax/libs/readability/0.6.0/Readability.js -o extension/src/readability.js)",
+      "Bash(node scripts/validate.js)"
+    ]
+  }
+}
