@@ -1,16 +1,68 @@
 // Save to Voyager — background service worker (MV3)
 
+// --- Context menu ---
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[Voyager] Extension installed.');
+
+  chrome.contextMenus.create({
+    id: 'save-selection',
+    title: 'Save selection to Voyager',
+    contexts: ['selection']
+  });
+
+  chrome.contextMenus.create({
+    id: 'save-page',
+    title: 'Save page to Voyager',
+    contexts: ['page']
+  });
 });
 
-// Listen for messages from popup or content scripts
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'save-selection') {
+    const data = {
+      url: tab.url,
+      title: tab.title,
+      content: info.selectionText,
+      excerpt: info.selectionText.slice(0, 200),
+      byline: '',
+      siteName: new URL(tab.url).hostname
+    };
+    handleCapture(data, tab)
+      .then(() => notifyTab(tab.id, 'Selection saved to Voyager!', 'success'))
+      .catch(err => notifyTab(tab.id, err.message, 'error'));
+  }
+
+  if (info.menuItemId === 'save-page') {
+    chrome.tabs.sendMessage(tab.id, { action: 'extractContent' }, (response) => {
+      if (chrome.runtime.lastError || !response?.success) {
+        const fallback = {
+          url: tab.url,
+          title: tab.title,
+          content: '',
+          excerpt: '',
+          byline: '',
+          siteName: new URL(tab.url).hostname
+        };
+        handleCapture(fallback, tab)
+          .then(() => notifyTab(tab.id, 'Page saved to Voyager!', 'success'))
+          .catch(err => notifyTab(tab.id, err.message, 'error'));
+        return;
+      }
+
+      handleCapture(response.data, tab)
+        .then(() => notifyTab(tab.id, 'Page saved to Voyager!', 'success'))
+        .catch(err => notifyTab(tab.id, err.message, 'error'));
+    });
+  }
+});
+
+// --- Message listener ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'capture') {
     handleCapture(message.data, sender.tab)
       .then(result => sendResponse({ success: true, result }))
       .catch(err => sendResponse({ success: false, error: err.message }));
-    return true; // keep channel open for async response
+    return true;
   }
 
   if (message.action === 'getSettings') {
@@ -21,6 +73,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+// --- Core capture logic ---
 async function handleCapture(data, tab) {
   const settings = await chrome.storage.sync.get(['webhookUrl']);
   const webhookUrl = settings.webhookUrl;
@@ -60,4 +113,8 @@ function detectSource(url) {
   if (url.includes('substack.com')) return 'substack';
   if (url.includes('medium.com')) return 'medium';
   return 'web';
+}
+
+function notifyTab(tabId, message, type) {
+  chrome.tabs.sendMessage(tabId, { action: 'showNotification', message, type }).catch(() => {});
 }
