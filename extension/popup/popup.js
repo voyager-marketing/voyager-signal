@@ -22,8 +22,21 @@ let extractedData = null;
 // --- Init ---
 versionEl.textContent = 'v' + chrome.runtime.getManifest().version;
 loadSettings();
+checkOnboarding();
 extractCurrentPage();
 loadHistory();
+
+// --- Onboarding check ---
+function checkOnboarding() {
+  chrome.storage.sync.get(['claudeApiKey', 'notionToken'], (s) => {
+    if (!s.claudeApiKey || !s.notionToken) {
+      showStatus('Set up your API keys in Settings below to get started.', 'loading');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Configure Settings First';
+      document.getElementById('settings-panel').open = true;
+    }
+  });
+}
 
 // --- Extract content from active tab ---
 function extractCurrentPage() {
@@ -100,10 +113,15 @@ saveBtn.addEventListener('click', () => {
 
     if (response && response.success) {
       const r = response.result;
-      showStatus('Saved to Voyager!', 'success');
-      saveBtn.textContent = 'Saved!';
-      showEnrichment(r);
-      loadHistory();
+      if (r.status === 'duplicate') {
+        showStatus('Already in the brain — skipped duplicate.', 'error');
+        saveBtn.textContent = 'Already Saved';
+      } else {
+        showStatus('Saved to Voyager!', 'success');
+        saveBtn.textContent = 'Saved!';
+        showEnrichment(r);
+        loadHistory();
+      }
     } else {
       showStatus('Error: ' + (response?.error || 'Unknown error'), 'error');
       saveBtn.disabled = false;
@@ -182,16 +200,56 @@ saveSettingsBtn.addEventListener('click', () => {
     return;
   }
 
-  chrome.storage.sync.set({
-    claudeApiKey: claudeKey,
-    notionToken: notionToken,
-    notionDbId: notionDbIdInput.value.trim(),
-    slackWebhookUrl: slackWebhookInput.value.trim()
-  }, () => {
-    showStatus('Settings saved.', 'success');
-    setTimeout(() => hideStatus(), 2000);
+  saveSettingsBtn.disabled = true;
+  saveSettingsBtn.textContent = 'Validating…';
+  showStatus('Testing API connections…', 'loading');
+
+  // Quick validation: test Claude API key
+  validateClaudeKey(claudeKey).then(valid => {
+    if (!valid) {
+      showStatus('Invalid Claude API key — check and retry.', 'error');
+      saveSettingsBtn.disabled = false;
+      saveSettingsBtn.textContent = 'Save Settings';
+      return;
+    }
+
+    chrome.storage.sync.set({
+      claudeApiKey: claudeKey,
+      notionToken: notionToken,
+      notionDbId: notionDbIdInput.value.trim(),
+      slackWebhookUrl: slackWebhookInput.value.trim()
+    }, () => {
+      showStatus('Settings saved — you\'re ready to go!', 'success');
+      saveSettingsBtn.disabled = false;
+      saveSettingsBtn.textContent = 'Save Settings';
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save to Voyager';
+      setTimeout(() => hideStatus(), 3000);
+    });
   });
 });
+
+async function validateClaudeKey(key) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }]
+      })
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
 
 // --- History ---
 function loadHistory() {

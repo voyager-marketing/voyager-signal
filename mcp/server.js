@@ -323,6 +323,283 @@ Write in a direct, strategic tone. This is for practitioners, not academics.`;
   }
 );
 
+// --- weekly_digest ---
+server.tool(
+  'weekly_digest',
+  'Generate a weekly digest of all captures grouped by domain, sorted by score. Includes themes, top signals, and recommended actions. Perfect for team sync or strategy review.',
+  {
+    days: z.number().optional().default(7).describe('Lookback window in days (default 7)')
+  },
+  async ({ days }) => {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const data = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filter: { timestamp: 'created_time', created_time: { on_or_after: since } },
+        sorts: [{ property: 'Score', direction: 'descending' }],
+        page_size: 100
+      })
+    });
+
+    const entries = data.results.map(formatPage);
+    if (entries.length === 0) {
+      return { content: [{ type: 'text', text: `No entries in the last ${days} days.` }] };
+    }
+
+    // Group by domain
+    const byDomain = {};
+    let totalScore = 0;
+    entries.forEach(e => {
+      const d = e.domain || 'uncategorized';
+      if (!byDomain[d]) byDomain[d] = [];
+      byDomain[d].push(e);
+      totalScore += (e.score || 0);
+    });
+
+    const topSignals = entries.filter(e => e.score >= 5).slice(0, 5);
+    const avgScore = (totalScore / entries.length).toFixed(1);
+
+    // Build digest markdown
+    let md = `# Voyager Brain — ${days}-Day Digest\n\n`;
+    md += `**${entries.length} captures** | Avg score: ${avgScore} | Top signals: ${topSignals.length}\n\n`;
+
+    if (topSignals.length > 0) {
+      md += `## Top Signals (Score 5)\n\n`;
+      topSignals.forEach(e => {
+        md += `- **${e.title}** (${e.source}) — ${e.summary}\n`;
+      });
+      md += '\n';
+    }
+
+    md += `## By Domain\n\n`;
+    Object.entries(byDomain).sort((a, b) => b[1].length - a[1].length).forEach(([domain, items]) => {
+      md += `### ${domain} (${items.length})\n`;
+      items.slice(0, 5).forEach(e => {
+        md += `- [${e.score}] ${e.title} — ${e.summary.slice(0, 100)}\n`;
+      });
+      if (items.length > 5) md += `- _...and ${items.length - 5} more_\n`;
+      md += '\n';
+    });
+
+    // Use Claude for themes if available
+    if (CLAUDE_API_KEY) {
+      const summaries = entries.slice(0, 30).map(e =>
+        `[${e.score}] (${e.domain}) ${e.title}: ${e.summary}`
+      ).join('\n');
+
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: `Here are ${entries.length} entries captured over the last ${days} days:\n\n${summaries}\n\nIn 3-5 bullet points, identify the key themes across these entries. Then suggest 2-3 specific actions the marketing team should take based on these signals. Be direct and strategic.` }]
+        })
+      });
+
+      if (res.ok) {
+        const result = await res.json();
+        md += `## AI Analysis\n\n${result.content?.[0]?.text || ''}\n`;
+      }
+    }
+
+    return { content: [{ type: 'text', text: md }] };
+  }
+);
+
+// --- find_related ---
+server.tool(
+  'find_related',
+  'Given a Notion page ID, find other entries in the brain that are related by tags, domain, or topic. Returns ranked matches.',
+  {
+    page_id: z.string().describe('Notion page ID to find related entries for'),
+    limit: z.number().optional().default(5).describe('Max related entries (default 5)')
+  },
+  async ({ page_id, limit }) => {
+    const page = await notionFetch(`/pages/${page_id}`);
+    const entry = formatPage(page);
+
+    // Build search filters from the entry's tags and domain
+    const orFilters = [];
+    if (entry.domain) {
+      orFilters.push({ property: 'Domain', select: { equals: entry.domain } });
+    }
+    entry.tags.forEach(tag => {
+      orFilters.push({ property: 'Tags', multi_select: { contains: tag } });
+    });
+    // Also search by title keywords
+    const keywords = entry.title.split(/\s+/).filter(w => w.length > 4).slice(0, 3);
+    keywords.forEach(kw => {
+      orFilters.push({ property: 'Name', title: { contains: kw } });
+    });
+
+    if (orFilters.length === 0) {
+      return { content: [{ type: 'text', text: 'Not enough metadata to find related entries.' }] };
+    }
+
+    const data = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filter: { or: orFilters },
+        sorts: [{ property: 'Score', direction: 'descending' }],
+        page_size: limit + 1
+      })
+    });
+
+    // Filter out the source page itself
+    const related = data.results
+      .map(formatPage)
+      .filter(e => e.id !== page_id)
+      .slice(0, limit);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ source: entry, related }, null, 2)
+      }]
+    };
+  }
+);
+
+// --- knowledge_gaps ---
+server.tool(
+  'knowledge_gaps',
+  'Analyze the brain\'s coverage over the last N days and identify gaps — thin domains, missing signal types, and suggested research topics.',
+  {
+    days: z.number().optional().default(30).describe('Lookback window (default 30)')
+  },
+  async ({ days }) => {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const data = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filter: { timestamp: 'created_time', created_time: { on_or_after: since } },
+        page_size: 100
+      })
+    });
+
+    const entries = data.results.map(formatPage);
+
+    // Count by domain and signal type
+    const domainCounts = {};
+    const typeCounts = {};
+    const tagCounts = {};
+    entries.forEach(e => {
+      domainCounts[e.domain || 'unknown'] = (domainCounts[e.domain || 'unknown'] || 0) + 1;
+      typeCounts[e.signal_type || 'unknown'] = (typeCounts[e.signal_type || 'unknown'] || 0) + 1;
+      e.tags.forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + 1; });
+    });
+
+    const coverage = {
+      total: entries.length,
+      period_days: days,
+      domains: domainCounts,
+      signal_types: typeCounts,
+      top_tags: Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).slice(0, 15)
+    };
+
+    // Use Claude to analyze gaps
+    if (CLAUDE_API_KEY && entries.length > 0) {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: `Analyze this knowledge base coverage for a marketing agency:\n\n${JSON.stringify(coverage, null, 2)}\n\nAll possible domains: ai, growth, brand, content, social, seo, paid, strategy, product, culture, tech, design.\nAll possible signal types: trend, competitor, tactic, insight, framework, case-study, data, opinion, tool, announcement.\n\nIdentify:\n1. Which domains have thin or zero coverage (knowledge gaps)\n2. Which signal types are over/under-represented\n3. 5 specific topics the team should research next to fill gaps\n4. Any blind spots in the current collection strategy\n\nBe specific and actionable.` }]
+        })
+      });
+
+      if (res.ok) {
+        const result = await res.json();
+        coverage.analysis = result.content?.[0]?.text || '';
+      }
+    }
+
+    return { content: [{ type: 'text', text: JSON.stringify(coverage, null, 2) }] };
+  }
+);
+
+// --- get_actions ---
+server.tool(
+  'get_actions',
+  'Scan recent brain entries and collect all action items from high-signal captures. Returns a consolidated action list grouped by domain.',
+  {
+    days: z.number().optional().default(14).describe('Lookback window (default 14)'),
+    min_score: z.number().optional().default(3).describe('Minimum score (default 3)')
+  },
+  async ({ days, min_score }) => {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const data = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filter: {
+          and: [
+            { property: 'Score', number: { greater_than_or_equal_to: min_score } },
+            { timestamp: 'created_time', created_time: { on_or_after: since } }
+          ]
+        },
+        sorts: [{ property: 'Score', direction: 'descending' }],
+        page_size: 50
+      })
+    });
+
+    const entries = data.results.map(formatPage);
+
+    // For each entry, fetch the page blocks to find to-do items
+    const actions = [];
+    for (const entry of entries.slice(0, 20)) {
+      try {
+        const blocks = await notionFetch(`/blocks/${entry.id}/children?page_size=100`);
+        const todos = blocks.results
+          .filter(b => b.type === 'to_do')
+          .map(b => ({
+            action: extractText(b.to_do?.rich_text),
+            done: b.to_do?.checked || false,
+            from: entry.title,
+            domain: entry.domain,
+            score: entry.score,
+            url: entry.url
+          }));
+        actions.push(...todos);
+      } catch {
+        // Skip entries we can't read
+      }
+    }
+
+    // Group by domain
+    const byDomain = {};
+    actions.forEach(a => {
+      const d = a.domain || 'general';
+      if (!byDomain[d]) byDomain[d] = [];
+      byDomain[d].push(a);
+    });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          total_actions: actions.length,
+          pending: actions.filter(a => !a.done).length,
+          completed: actions.filter(a => a.done).length,
+          by_domain: byDomain
+        }, null, 2)
+      }]
+    };
+  }
+);
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------

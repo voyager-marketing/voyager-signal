@@ -163,12 +163,24 @@ async function handleCapture(data) {
   }
 
   const source = detectSource(data.url);
+  const notionDbId = settings.notionDbId || '81eb2b5a-05f6-433e-8c89-0d7c78cb798e';
+
+  // Step 0: Check for duplicates — skip if URL already in brain
+  const existing = await checkDuplicate(settings.notionToken, notionDbId, data.url);
+  if (existing) {
+    return {
+      status: 'duplicate',
+      url: data.url,
+      score: existing.score,
+      summary: 'Already in the brain — skipped.',
+      notionPageId: existing.id
+    };
+  }
 
   // Step 1: Deep synthesis with Claude
   const synthesis = await synthesizeWithClaude(settings.claudeApiKey, data, source);
 
   // Step 2: Write rich knowledge entry to Notion
-  const notionDbId = settings.notionDbId || '81eb2b5a-05f6-433e-8c89-0d7c78cb798e';
   const notionPage = await writeToNotion(
     settings.notionToken, notionDbId, data, synthesis, source
   );
@@ -277,6 +289,12 @@ async function writeToNotion(notionToken, databaseId, data, synthesis, source) {
     },
     'Byline': {
       rich_text: [{ text: { content: (data.byline || '').slice(0, 200) } }]
+    },
+    'Word Count': {
+      number: wordCount(data.content)
+    },
+    'Reading Time': {
+      rich_text: [{ text: { content: readingTime(data.content) } }]
     }
   };
 
@@ -350,6 +368,19 @@ function buildNotionBody(data, synthesis) {
     synthesis.key_quotes.forEach(q => blocks.push(quote(q)));
   }
 
+  // Full article text in a toggle (collapsible)
+  if (data.content && data.content.length > 100) {
+    blocks.push(divider());
+    const chunks = chunkText(data.content, 1900);
+    blocks.push({
+      object: 'block', type: 'toggle',
+      toggle: {
+        rich_text: [{ type: 'text', text: { content: `Full Article (${wordCount(data.content)} words, ${readingTime(data.content)})` } }],
+        children: chunks.map(chunk => paragraph(chunk))
+      }
+    });
+  }
+
   // Source metadata
   blocks.push(divider());
   blocks.push(paragraph(
@@ -417,6 +448,41 @@ async function sendSlackAlert(webhookUrl, data, synthesis) {
 }
 
 // ---------------------------------------------------------------------------
+// Duplicate detection — check if URL already exists in Notion
+// ---------------------------------------------------------------------------
+
+async function checkDuplicate(notionToken, databaseId, url) {
+  try {
+    const response = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${notionToken}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28'
+      },
+      body: JSON.stringify({
+        filter: { property: 'URL', url: { equals: url } },
+        page_size: 1
+      })
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    if (data.results && data.results.length > 0) {
+      const page = data.results[0];
+      return {
+        id: page.id,
+        score: page.properties?.Score?.number ?? null
+      };
+    }
+  } catch (err) {
+    console.warn('[Voyager] Duplicate check failed, proceeding:', err);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -443,6 +509,25 @@ function showBadge({ text, color, duration }, tabId) {
   setTimeout(() => {
     chrome.action.setBadgeText({ text: '', ...tabArgs });
   }, duration);
+}
+
+function wordCount(text) {
+  if (!text) return 0;
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+function readingTime(text) {
+  const words = wordCount(text);
+  const mins = Math.max(1, Math.round(words / 230));
+  return `${mins} min read`;
+}
+
+function chunkText(text, maxLen) {
+  const chunks = [];
+  for (let i = 0; i < text.length; i += maxLen) {
+    chunks.push(text.slice(i, i + maxLen));
+  }
+  return chunks.slice(0, 50); // Notion limit: 100 children max
 }
 
 function detectSource(url) {
