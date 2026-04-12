@@ -25,6 +25,18 @@ const PENDING_CAPTURES_KEY = 'pendingCaptures';
 const URL_CACHE_KEY = 'urlCache';
 const URL_CACHE_MAX = 500;
 
+const AUTO_CAPTURE_DEFAULTS = {
+  autoCapture: false,
+  autoCapturePatterns: [
+    'x.com/*/status',
+    'substack.com/p/',
+    'linkedin.com/pulse/'
+  ]
+};
+
+const AUTO_CAPTURE_DEBOUNCE_MS = 2000;
+const BULK_CAPTURE_DELAY_MS = 2000;
+
 // ---------------------------------------------------------------------------
 // Retry helper — exponential backoff for API calls
 // ---------------------------------------------------------------------------
@@ -182,6 +194,19 @@ chrome.runtime.onInstalled.addListener(() => {
     contexts: ['page', 'selection', 'link']
   });
 
+  chrome.contextMenus.create({
+    id: 'save-all-links-to-voyager',
+    title: 'Save all links to Voyager',
+    contexts: ['selection']
+  });
+
+  // Initialize auto-capture defaults if not set
+  chrome.storage.sync.get(['autoCapture', 'autoCapturePatterns'], (result) => {
+    if (result.autoCapture === undefined) {
+      chrome.storage.sync.set(AUTO_CAPTURE_DEFAULTS);
+    }
+  });
+
   // Flush any pending captures from before install/update
   flushPendingCaptures();
 });
@@ -200,8 +225,15 @@ self.addEventListener('online', () => {
 // ---------------------------------------------------------------------------
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'save-to-voyager') return;
-  await captureFromTab(tab);
+  if (info.menuItemId === 'save-to-voyager') {
+    await captureFromTab(tab);
+    return;
+  }
+
+  if (info.menuItemId === 'save-all-links-to-voyager') {
+    await bulkCaptureSelectedLinks(tab);
+    return;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -244,6 +276,131 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Auto-capture — listen for matching page loads
+// ---------------------------------------------------------------------------
+
+const _autoCaptureTimers = {};
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete') return;
+  if (!tab.url || isRestrictedUrl(tab.url)) return;
+
+  chrome.storage.sync.get(['autoCapture', 'autoCapturePatterns'], (settings) => {
+    if (!settings.autoCapture) return;
+
+    const patterns = settings.autoCapturePatterns || AUTO_CAPTURE_DEFAULTS.autoCapturePatterns;
+    const matches = patterns.some((pattern) => tab.url.includes(pattern));
+    if (!matches) return;
+
+    // Debounce: clear any pending capture for this tab
+    if (_autoCaptureTimers[tabId]) {
+      clearTimeout(_autoCaptureTimers[tabId]);
+    }
+
+    _autoCaptureTimers[tabId] = setTimeout(async () => {
+      delete _autoCaptureTimers[tabId];
+      console.log('[Voyager] Auto-capture triggered for:', tab.url);
+      await captureFromTab(tab);
+    }, AUTO_CAPTURE_DEBOUNCE_MS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bulk import — capture all links from a text selection
+// ---------------------------------------------------------------------------
+
+let _bulkQueue = [];
+let _bulkRunning = false;
+
+async function bulkCaptureSelectedLinks(tab) {
+  if (!tab?.id) return;
+
+  try {
+    await ensureContentScript(tab.id);
+
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      action: 'getSelectedLinks'
+    });
+
+    if (!response || !response.success || !response.urls || response.urls.length === 0) {
+      showBadge(BADGE_ERROR, tab.id);
+      console.warn('[Voyager] No links found in selection.');
+      return;
+    }
+
+    // Filter out restricted URLs and deduplicate
+    const urls = [...new Set(response.urls)].filter((url) => !isRestrictedUrl(url));
+
+    if (urls.length === 0) {
+      showBadge(BADGE_ERROR, tab.id);
+      return;
+    }
+
+    console.log(`[Voyager] Bulk import: queuing ${urls.length} links.`);
+
+    // Add URLs to the queue
+    _bulkQueue.push(...urls);
+    updateBulkBadge();
+
+    if (!_bulkRunning) {
+      processBulkQueue();
+    }
+  } catch (err) {
+    console.error('[Voyager] Bulk capture failed:', err);
+    showBadge(BADGE_ERROR, tab.id);
+  }
+}
+
+async function processBulkQueue() {
+  _bulkRunning = true;
+
+  while (_bulkQueue.length > 0) {
+    const url = _bulkQueue.shift();
+    updateBulkBadge();
+
+    try {
+      // Open the URL in a new tab, wait for it, capture, then close
+      const newTab = await chrome.tabs.create({ url, active: false });
+
+      // Wait for the tab to finish loading
+      await new Promise((resolve) => {
+        const listener = (tabId, changeInfo) => {
+          if (tabId === newTab.id && changeInfo.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
+
+      await captureFromTab(newTab);
+      await chrome.tabs.remove(newTab.id);
+    } catch (err) {
+      console.error('[Voyager] Bulk capture error for', url, ':', err);
+    }
+
+    // Delay between captures
+    if (_bulkQueue.length > 0) {
+      await new Promise((resolve) => setTimeout(resolve, BULK_CAPTURE_DELAY_MS));
+    }
+  }
+
+  _bulkRunning = false;
+  // Clear badge when done
+  chrome.action.setBadgeText({ text: '' });
+}
+
+function updateBulkBadge() {
+  const remaining = _bulkQueue.length;
+  if (remaining > 0) {
+    chrome.action.setBadgeBackgroundColor({ color: '#3b82f6' });
+    chrome.action.setBadgeText({ text: String(remaining) });
+  } else {
+    chrome.action.setBadgeText({ text: '' });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tab capture — shared by context menu & keyboard command

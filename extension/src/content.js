@@ -13,6 +13,15 @@
       }
     }
 
+    if (message.action === 'getSelectedLinks') {
+      try {
+        const urls = getSelectedLinks();
+        sendResponse({ success: true, urls });
+      } catch (err) {
+        sendResponse({ success: false, error: err.message, urls: [] });
+      }
+    }
+
     if (message.action === 'showNotification') {
       showToast(message.message, message.type);
     }
@@ -62,6 +71,57 @@
       byline: article.byline || '',
       siteName: article.siteName || location.hostname
     };
+  }
+
+  function getSelectedLinks() {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return [];
+
+    const urls = [];
+    for (let i = 0; i < selection.rangeCount; i++) {
+      const range = selection.getRangeAt(i);
+      const container = range.cloneContents();
+      const anchors = container.querySelectorAll('a[href]');
+      anchors.forEach((a) => {
+        const href = a.getAttribute('href');
+        if (href) {
+          // Resolve relative URLs
+          try {
+            const resolved = new URL(href, location.href).href;
+            if (resolved.startsWith('http://') || resolved.startsWith('https://')) {
+              urls.push(resolved);
+            }
+          } catch (e) {
+            // skip malformed URLs
+          }
+        }
+      });
+    }
+
+    // Also check if selected nodes contain anchors that cloneContents might miss
+    // (e.g., when selection starts/ends inside an anchor)
+    if (urls.length === 0 && selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0);
+      const ancestor = range.commonAncestorContainer;
+      const root = ancestor.nodeType === Node.ELEMENT_NODE ? ancestor : ancestor.parentElement;
+      if (root) {
+        const allAnchors = root.querySelectorAll('a[href]');
+        allAnchors.forEach((a) => {
+          if (selection.containsNode(a, true)) {
+            try {
+              const resolved = new URL(a.href, location.href).href;
+              if (resolved.startsWith('http://') || resolved.startsWith('https://')) {
+                urls.push(resolved);
+              }
+            } catch (e) {
+              // skip
+            }
+          }
+        });
+      }
+    }
+
+    return [...new Set(urls)];
   }
 
   function showToast(msg, type) {
