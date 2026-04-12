@@ -21,6 +21,126 @@ const BADGE_WORKING = { text: '…',  color: '#3b82f6', duration: 30000 };
 const SAVE_HISTORY_KEY = 'saveHistory';
 const SAVE_HISTORY_MAX = 50;
 
+const PENDING_CAPTURES_KEY = 'pendingCaptures';
+const URL_CACHE_KEY = 'urlCache';
+const URL_CACHE_MAX = 500;
+
+// ---------------------------------------------------------------------------
+// Retry helper — exponential backoff for API calls
+// ---------------------------------------------------------------------------
+
+async function fetchWithRetry(url, options, { maxAttempts = 3, baseDelay = 1000 } = {}) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(url, options);
+
+      if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+        return response;
+      }
+
+      // Retry on 429 and 5xx
+      if (attempt < maxAttempts && (response.status === 429 || response.status >= 500)) {
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        console.warn(`[Voyager] Retrying ${url} (attempt ${attempt}/${maxAttempts}, status ${response.status}, delay ${delay}ms)`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      return response;
+    } catch (err) {
+      // Network errors (TypeError from fetch) — don't retry, let caller handle for offline queue
+      if (err instanceof TypeError) {
+        throw err;
+      }
+      if (attempt < maxAttempts) {
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        console.warn(`[Voyager] Retrying ${url} (attempt ${attempt}/${maxAttempts}, error: ${err.message}, delay ${delay}ms)`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// URL cache — local duplicate detection before querying Notion
+// ---------------------------------------------------------------------------
+
+async function isUrlInCache(url) {
+  try {
+    const store = await chrome.storage.local.get([URL_CACHE_KEY]);
+    const cache = store[URL_CACHE_KEY] || [];
+    return cache.includes(url);
+  } catch {
+    return false;
+  }
+}
+
+async function addUrlToCache(url) {
+  try {
+    const store = await chrome.storage.local.get([URL_CACHE_KEY]);
+    const cache = store[URL_CACHE_KEY] || [];
+
+    if (!cache.includes(url)) {
+      cache.push(url);
+      // FIFO eviction — remove oldest entries if over cap
+      while (cache.length > URL_CACHE_MAX) {
+        cache.shift();
+      }
+      await chrome.storage.local.set({ [URL_CACHE_KEY]: cache });
+    }
+  } catch (err) {
+    console.warn('[Voyager] Failed to update URL cache:', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Offline queue — save failed captures for retry when back online
+// ---------------------------------------------------------------------------
+
+async function addToPendingCaptures(data) {
+  try {
+    const store = await chrome.storage.local.get([PENDING_CAPTURES_KEY]);
+    const pending = store[PENDING_CAPTURES_KEY] || [];
+    pending.push({ data, timestamp: Date.now() });
+    await chrome.storage.local.set({ [PENDING_CAPTURES_KEY]: pending });
+    console.log(`[Voyager] Queued capture for offline retry: ${data.url}`);
+  } catch (err) {
+    console.error('[Voyager] Failed to queue pending capture:', err);
+  }
+}
+
+async function flushPendingCaptures() {
+  try {
+    const store = await chrome.storage.local.get([PENDING_CAPTURES_KEY]);
+    const pending = store[PENDING_CAPTURES_KEY] || [];
+    if (pending.length === 0) return;
+
+    console.log(`[Voyager] Flushing ${pending.length} pending capture(s)…`);
+    const remaining = [];
+
+    for (const entry of pending) {
+      try {
+        await handleCapture(entry.data);
+        console.log(`[Voyager] Successfully flushed: ${entry.data.url}`);
+      } catch (err) {
+        if (err instanceof TypeError) {
+          // Still offline — keep in queue
+          remaining.push(entry);
+        } else {
+          console.warn(`[Voyager] Flush failed permanently for ${entry.data.url}:`, err);
+          // Drop permanently failed captures (non-network errors)
+        }
+      }
+    }
+
+    await chrome.storage.local.set({ [PENDING_CAPTURES_KEY]: remaining });
+  } catch (err) {
+    console.error('[Voyager] Failed to flush pending captures:', err);
+  }
+}
+
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 
@@ -61,6 +181,18 @@ chrome.runtime.onInstalled.addListener(() => {
     title: 'Save to Voyager',
     contexts: ['page', 'selection', 'link']
   });
+
+  // Flush any pending captures from before install/update
+  flushPendingCaptures();
+});
+
+// Flush pending captures on service worker startup
+flushPendingCaptures();
+
+// Listen for connectivity changes to flush offline queue
+self.addEventListener('online', () => {
+  console.log('[Voyager] Back online — flushing pending captures.');
+  flushPendingCaptures();
 });
 
 // ---------------------------------------------------------------------------
@@ -165,9 +297,22 @@ async function handleCapture(data) {
   const source = detectSource(data.url);
   const notionDbId = settings.notionDbId || '81eb2b5a-05f6-433e-8c89-0d7c78cb798e';
 
-  // Step 0: Check for duplicates — skip if URL already in brain
+  // Step 0: Check for duplicates — local cache first, then Notion
+  const cachedDuplicate = await isUrlInCache(data.url);
+  if (cachedDuplicate) {
+    return {
+      status: 'duplicate',
+      url: data.url,
+      score: null,
+      summary: 'Already in the brain — skipped (cache hit).',
+      notionPageId: null
+    };
+  }
+
   const existing = await checkDuplicate(settings.notionToken, notionDbId, data.url);
   if (existing) {
+    // Add to local cache so future checks skip the Notion query
+    await addUrlToCache(data.url);
     return {
       status: 'duplicate',
       url: data.url,
@@ -177,32 +322,44 @@ async function handleCapture(data) {
     };
   }
 
-  // Step 1: Deep synthesis with Claude
-  const synthesis = await synthesizeWithClaude(settings.claudeApiKey, data, source);
+  try {
+    // Step 1: Deep synthesis with Claude
+    const synthesis = await synthesizeWithClaude(settings.claudeApiKey, data, source);
 
-  // Step 2: Write rich knowledge entry to Notion
-  const notionPage = await writeToNotion(
-    settings.notionToken, notionDbId, data, synthesis, source
-  );
+    // Step 2: Write rich knowledge entry to Notion
+    const notionPage = await writeToNotion(
+      settings.notionToken, notionDbId, data, synthesis, source
+    );
 
-  // Step 3: Slack alert if score >= 5
-  if (synthesis.score >= 5 && settings.slackWebhookUrl) {
-    await sendSlackAlert(settings.slackWebhookUrl, data, synthesis);
+    // Step 3: Slack alert if score >= 5
+    if (synthesis.score >= 5 && settings.slackWebhookUrl) {
+      await sendSlackAlert(settings.slackWebhookUrl, data, synthesis);
+    }
+
+    // Add to URL cache after successful save
+    await addUrlToCache(data.url);
+
+    return {
+      status: 'saved',
+      url: data.url,
+      score: synthesis.score,
+      summary: synthesis.summary,
+      key_takeaways: synthesis.key_takeaways,
+      action_items: synthesis.action_items,
+      domain: synthesis.domain,
+      signal_type: synthesis.signal_type,
+      novelty: synthesis.novelty,
+      tags: synthesis.tags,
+      notionPageId: notionPage?.id || null
+    };
+  } catch (err) {
+    // If network error, queue for offline retry
+    if (err instanceof TypeError) {
+      await addToPendingCaptures(data);
+      throw new Error('Offline — capture queued for retry when connectivity returns.');
+    }
+    throw err;
   }
-
-  return {
-    status: 'saved',
-    url: data.url,
-    score: synthesis.score,
-    summary: synthesis.summary,
-    key_takeaways: synthesis.key_takeaways,
-    action_items: synthesis.action_items,
-    domain: synthesis.domain,
-    signal_type: synthesis.signal_type,
-    novelty: synthesis.novelty,
-    tags: synthesis.tags,
-    notionPageId: notionPage?.id || null
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +378,7 @@ Byline: ${data.byline || 'Unknown'}
 Content:
 ${contentSnippet}`;
 
-  const response = await fetch(CLAUDE_API_URL, {
+  const response = await fetchWithRetry(CLAUDE_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -307,7 +464,7 @@ async function writeToNotion(notionToken, databaseId, data, synthesis, source) {
   // Page body — the rich knowledge card
   const children = buildNotionBody(data, synthesis);
 
-  const response = await fetch('https://api.notion.com/v1/pages', {
+  const response = await fetchWithRetry('https://api.notion.com/v1/pages', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${notionToken}`,
@@ -453,7 +610,7 @@ async function sendSlackAlert(webhookUrl, data, synthesis) {
 
 async function checkDuplicate(notionToken, databaseId, url) {
   try {
-    const response = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+    const response = await fetchWithRetry(`https://api.notion.com/v1/databases/${databaseId}/query`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${notionToken}`,
